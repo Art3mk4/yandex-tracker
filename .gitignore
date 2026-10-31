@@ -1,0 +1,20 @@
+# локальные данные и секреты — не публикуются
+.env
+TIMESHEET.md
+data/
+sync.js
+timesheet.json
+projects.json
+
+# внутренняя документация (рабочий контекст) — локально
+CLAUDE.md
+LOCAL.md
+KNOWLEDGE.md
+PLAN-db.md
+EXTENSION.md
+
+# сборка и кэши
+__pycache__/
+*.pyc
+frontend/node_modules/
+frontend/dist/
