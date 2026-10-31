@@ -97,6 +97,19 @@ API зеркала: `GET /api/issues?q=&queue=`, `GET /api/issues/{key}` (кар
 комментарии, вложения, история), `GET /api/attachments/{id}/download`,
 `GET /api/mirror/status`.
 
+## Разработка
+
+```bash
+# бэкенд: тесты и линт (в контейнере — зависимости не нужны на хосте)
+docker compose run --rm app pytest
+
+# фронтенд (frontend/, node 22): типы, линт, тесты, dev-сервер
+npm run check    # vue-tsc
+npm run lint     # eslint (flat config)
+npm run test     # vitest
+npm run dev      # vite с прокси /api на 127.0.0.1:8787
+```
+
 ## Находки про API Яндекс Трекера
 
 Всё проверено на живом API (v3), сэкономит часы отладки:

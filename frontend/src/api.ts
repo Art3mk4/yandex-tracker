@@ -13,7 +13,7 @@ import type {
 type Params = Record<string, string | number | null | undefined>
 
 /** URL с query-параметрами; пустые значения пропускаются. */
-function withParams(path: string, params: Params): string {
+export function withParams(path: string, params: Params): string {
   const q = Object.entries(params)
     .filter(([, v]) => v !== null && v !== undefined && v !== '')
     .map(([k, v]) => `${k}=${encodeURIComponent(String(v))}`)
@@ -22,7 +22,7 @@ function withParams(path: string, params: Params): string {
 }
 
 /** Фильтры табеля → query-параметры. */
-function filterParams(f: Filters): Params {
+export function filterParams(f: Filters): Params {
   return {
     date_from: f.date_from,
     date_to: f.date_to,

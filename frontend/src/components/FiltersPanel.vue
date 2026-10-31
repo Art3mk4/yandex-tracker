@@ -1,7 +1,10 @@
 <script setup lang="ts">
 import type { Filters, Meta, Project } from '../types'
 
-defineProps<{ filters: Filters; meta: Meta | null; projects: Project[] }>()
+// filters — двусторонняя модель (v-model:filters): поля фильтров правятся
+// прямо в объекте родителя, без мутации пропа
+const filters = defineModel<Filters>('filters', { required: true })
+defineProps<{ meta: Meta | null; projects: Project[] }>()
 defineEmits<{ reset: [] }>()
 </script>
 

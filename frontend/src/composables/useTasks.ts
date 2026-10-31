@@ -1,4 +1,4 @@
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, onMounted, reactive, watch } from 'vue'
 
 import { getIssue, getIssues, getMirrorStatus } from '../api'
 import type { IssueDetail, IssueListItem, MirrorStatus } from '../types'

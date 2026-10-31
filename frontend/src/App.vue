@@ -63,7 +63,7 @@ const subtitle = computed(() => {
     </header>
 
     <div v-show="view === 'timesheet'" class="content" :class="{ loading: state.loading }">
-      <FiltersPanel :filters="filters" :meta="state.meta" :projects="state.projects" @reset="reset" />
+      <FiltersPanel v-model:filters="filters" :meta="state.meta" :projects="state.projects" @reset="reset" />
       <KpiTiles :hours="state.totalHours" :days="state.daily.length" :tasks="state.tasksTotal" />
       <div class="charts">
         <section class="card">
