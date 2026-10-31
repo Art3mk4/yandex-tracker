@@ -17,7 +17,7 @@ from datetime import datetime
 from pathlib import Path
 
 import httpx
-
+from psycopg import sql
 from psycopg.types.json import Jsonb
 
 from app.config import settings
@@ -37,6 +37,23 @@ class TrackerError(RuntimeError):
 
 def parse_ts(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value.replace("Z", "+00:00")) if value else None
+
+
+def sanitize(name: str) -> str:
+    return name.replace("/", "_").replace("\\", "_").replace("\x00", "") or "file"
+
+
+def link_next_params(link_header: str) -> dict | None:
+    """Параметры следующей страницы из Link: <url>; rel="next" (курсор id и т. п.)."""
+    import urllib.parse as up
+
+    for part in link_header.split(","):
+        if 'rel="next"' not in part or "<" not in part:
+            continue
+        url = part[part.find("<") + 1 : part.find(">")]
+        query = {k: v[0] for k, v in up.parse_qs(up.urlparse(url).query).items() if v and v[0]}
+        return query or None
+    return None
 
 
 class TrackerClient:
@@ -109,28 +126,195 @@ class TrackerClient:
         dest.write_bytes(r.content)
 
 
-def sanitize(name: str) -> str:
-    return name.replace("/", "_").replace("\\", "_").replace("\x00", "") or "file"
+# --- хелперы БД (общие для сущностей зеркала) ---
+
+def _existing_ids(cur, table: str, issue_id: str) -> set:
+    cur.execute(sql.SQL("SELECT id FROM {} WHERE issue_id = %s").format(
+        sql.Identifier(table)), (issue_id,))
+    return {r["id"] for r in cur.fetchall()}
 
 
-def link_next_params(link_header: str) -> dict | None:
-    """Параметры следующей страницы из Link: <url>; rel="next" (курсор id и т. п.)."""
-    import urllib.parse as up
+def _drop_missing(cur, table: str, issue_id: str, ids: list) -> None:
+    """Удалить строки задачи, исчезнувшие из Трекера (файл на диске остаётся)."""
+    if ids:
+        cur.execute(sql.SQL("DELETE FROM {} WHERE issue_id = %s AND id <> ALL(%s)").format(
+            sql.Identifier(table)), (issue_id, ids))
 
-    for part in link_header.split(","):
-        if 'rel="next"' not in part or "<" not in part:
-            continue
-        url = part[part.find("<") + 1 : part.find(">")]
-        query = {k: v[0] for k, v in up.parse_qs(up.urlparse(url).query).items() if v and v[0]}
-        return query or None
-    return None
+
+def _upsert_issue(cur, card: dict, row) -> None:
+    """Карточка + алиасы (перенос между очередями даёт алиас старого ключа)."""
+    issue_id, cur_key = card["id"], card["key"]
+    aliases = set(card.get("aliases") or [])
+    if row and row["key"] != cur_key:
+        aliases.add(row["key"])
+
+    def display(field: str) -> str | None:
+        return (card.get(field) or {}).get("display")
+
+    def login(field: str) -> str | None:
+        return (card.get(field) or {}).get("login")
+
+    cur.execute(
+        """INSERT INTO issues (id, key, summary, description, queue, queue_name,
+                 status_key, status_name, type_name, priority_name,
+                 assignee, assignee_name, created_by, created_by_name,
+                 followers, tags, created_at, updated_at, resolved_at, raw, synced_at)
+           VALUES (%(id)s, %(key)s, %(summary)s, %(description)s, %(queue)s, %(queue_name)s,
+                   %(status_key)s, %(status_name)s, %(type_name)s, %(priority_name)s,
+                   %(assignee)s, %(assignee_name)s, %(created_by)s, %(created_by_name)s,
+                   %(followers)s, %(tags)s, %(created_at)s, %(updated_at)s,
+                   %(resolved_at)s, %(raw)s, now())
+           ON CONFLICT (id) DO UPDATE SET
+             key = EXCLUDED.key, summary = EXCLUDED.summary,
+             description = EXCLUDED.description, queue = EXCLUDED.queue,
+             queue_name = EXCLUDED.queue_name, status_key = EXCLUDED.status_key,
+             status_name = EXCLUDED.status_name, type_name = EXCLUDED.type_name,
+             priority_name = EXCLUDED.priority_name, assignee = EXCLUDED.assignee,
+             assignee_name = EXCLUDED.assignee_name, created_by = EXCLUDED.created_by,
+             created_by_name = EXCLUDED.created_by_name, followers = EXCLUDED.followers,
+             tags = EXCLUDED.tags, created_at = EXCLUDED.created_at,
+             updated_at = EXCLUDED.updated_at, resolved_at = EXCLUDED.resolved_at,
+             raw = EXCLUDED.raw, synced_at = now()""",
+        {
+            "id": issue_id, "key": cur_key,
+            "summary": card.get("summary") or "",
+            "description": card.get("description") or "",
+            "queue": (card.get("queue") or {}).get("key", ""),
+            "queue_name": (card.get("queue") or {}).get("display", ""),
+            "status_key": (card.get("status") or {}).get("key"),
+            "status_name": display("status"), "type_name": display("type"),
+            "priority_name": display("priority"),
+            "assignee": login("assignee"), "assignee_name": display("assignee"),
+            "created_by": login("createdBy"), "created_by_name": display("createdBy"),
+            "followers": Jsonb([{"login": f.get("login"), "display": f.get("display")}
+                                for f in card.get("followers") or []]),
+            "tags": Jsonb(card.get("tags") or []),
+            "created_at": card.get("createdAt"), "updated_at": card.get("updatedAt"),
+            "resolved_at": card.get("resolvedAt"), "raw": Jsonb(card),
+        },
+    )
+    for alias in aliases - {cur_key}:
+        cur.execute(
+            """INSERT INTO issue_aliases (alias, issue_id) VALUES (%s, %s)
+               ON CONFLICT (alias) DO UPDATE SET issue_id = EXCLUDED.issue_id, seen_at = now()""",
+            (alias, issue_id),
+        )
+
+
+def _full_comment_text(client: TrackerClient, key: str, comment: dict) -> str:
+    """Страховка обрезки: длинный текст комментария дотягиваем поштучно."""
+    text = comment.get("text") or ""
+    if len(text) < TRUNCATION_GUARD:
+        return text
+    try:
+        detail = client.get_json(f"/issues/{key}/comments/{comment['id']}")
+        return detail.get("text") or text
+    except TrackerError:
+        return text
+
+
+def _sync_comments(client: TrackerClient, cur, issue_id: str, key: str, stats: dict) -> None:
+    comments = client.get_paginated(f"/issues/{key}/comments")
+    for c in comments:
+        c["text"] = _full_comment_text(client, key, c)
+    existing = _existing_ids(cur, "issue_comments", issue_id)
+    for c in comments:
+        cur.execute(
+            """INSERT INTO issue_comments (id, issue_id, long_id, text, author, author_name,
+                         created_at, updated_at, version, transport, type, raw, synced_at)
+               VALUES (%(id)s, %(issue_id)s, %(long_id)s, %(text)s, %(author)s, %(author_name)s,
+                       %(created_at)s, %(updated_at)s, %(version)s, %(transport)s, %(type)s,
+                       %(raw)s, now())
+               ON CONFLICT (id) DO UPDATE SET text = EXCLUDED.text,
+                 author = EXCLUDED.author, author_name = EXCLUDED.author_name,
+                 updated_at = EXCLUDED.updated_at, version = EXCLUDED.version,
+                 raw = EXCLUDED.raw, synced_at = now()""",
+            {
+                "id": c["id"], "issue_id": issue_id, "long_id": c.get("longId"),
+                "text": c.get("text") or "", "author": (c.get("createdBy") or {}).get("login"),
+                "author_name": (c.get("createdBy") or {}).get("display"),
+                "created_at": c.get("createdAt"), "updated_at": c.get("updatedAt"),
+                "version": c.get("version"), "transport": c.get("transport"),
+                "type": c.get("type"), "raw": Jsonb(c),
+            },
+        )
+    stats["comments_new"] = len({c["id"] for c in comments} - existing)
+    _drop_missing(cur, "issue_comments", issue_id, [c["id"] for c in comments])
+
+
+def _download_attachment(client: TrackerClient, att: dict, key: str) -> tuple[bool, int]:
+    """Скачать файл, если его нет или размер разошёлся. (скачано?, байт)."""
+    rel_path = f"{key}/{att['id']}_{sanitize(att.get('name') or '')}"
+    dest = settings.attachments_dir / rel_path
+    if not att.get("content") or (
+        dest.exists() and dest.stat().st_size == (att.get("size") or 0)
+    ):
+        return False, 0
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    client.download(att["content"], dest)
+    return True, att.get("size") or 0
+
+
+def _sync_attachments(client: TrackerClient, cur, issue_id: str, key: str, stats: dict) -> None:
+    atts = client.get_paginated(f"/issues/{key}/attachments")
+    existing = _existing_ids(cur, "issue_attachments", issue_id)
+    for a in atts:
+        rel_path = f"{key}/{a['id']}_{sanitize(a.get('name') or '')}"
+        cur.execute(
+            """INSERT INTO issue_attachments (id, issue_id, name, size, mimetype, author,
+                         created_at, content_url, raw, synced_at)
+               VALUES (%(id)s, %(issue_id)s, %(name)s, %(size)s, %(mimetype)s, %(author)s,
+                       %(created_at)s, %(content_url)s, %(raw)s, now())
+               ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, size = EXCLUDED.size,
+                 mimetype = EXCLUDED.mimetype, content_url = EXCLUDED.content_url,
+                 raw = EXCLUDED.raw, synced_at = now()""",
+            {
+                "id": int(a["id"]), "issue_id": issue_id, "name": a.get("name") or "",
+                "size": a.get("size") or 0, "mimetype": a.get("mimetype"),
+                "author": (a.get("createdBy") or {}).get("login"),
+                "created_at": a.get("createdAt"), "content_url": a.get("content") or "",
+                "raw": Jsonb(a),
+            },
+        )
+        downloaded, size = _download_attachment(client, a, key)
+        if downloaded:
+            stats["files_downloaded"] += 1
+            stats["bytes"] += size
+        cur.execute(
+            "UPDATE issue_attachments SET file_path = %s, downloaded_at = now() WHERE id = %s",
+            (rel_path, int(a["id"])),
+        )
+    stats["attachments_new"] = len({int(a["id"]) for a in atts} - existing)
+    _drop_missing(cur, "issue_attachments", issue_id, [int(a["id"]) for a in atts])
+
+
+def _sync_changelog(client: TrackerClient, cur, issue_id: str, key: str, stats: dict) -> None:
+    changes = client.get_paginated(f"/issues/{key}/changelog")
+    existing = _existing_ids(cur, "issue_changelog", issue_id)
+    for ch in changes:
+        cur.execute(
+            """INSERT INTO issue_changelog (id, issue_id, updated_at, author, author_name,
+                         transport, type, fields, raw, synced_at)
+               VALUES (%(id)s, %(issue_id)s, %(updated_at)s, %(author)s, %(author_name)s,
+                       %(transport)s, %(type)s, %(fields)s, %(raw)s, now())
+               ON CONFLICT (id) DO UPDATE SET updated_at = EXCLUDED.updated_at,
+                 fields = EXCLUDED.fields, raw = EXCLUDED.raw, synced_at = now()""",
+            {
+                "id": ch["id"], "issue_id": issue_id, "updated_at": ch.get("updatedAt"),
+                "author": (ch.get("updatedBy") or {}).get("login"),
+                "author_name": (ch.get("updatedBy") or {}).get("display"),
+                "transport": ch.get("transport"), "type": ch.get("type"),
+                "fields": Jsonb(ch.get("fields") or []), "raw": Jsonb(ch),
+            },
+        )
+    stats["changelog_new"] = len({c["id"] for c in changes} - existing)
+    _drop_missing(cur, "issue_changelog", issue_id, [c["id"] for c in changes])
 
 
 def sync_issue(client: TrackerClient, conn, key: str, full: bool) -> dict:
     """Синк одной задачи; одна транзакция, ошибка откатывает только её."""
     card = client.get_json(f"/issues/{key}")
-    issue_id = card["id"]
-    cur_key = card["key"]
+    issue_id, cur_key = card["id"], card["key"]
     stats = {"status": "", "comments_new": 0, "attachments_new": 0,
              "changelog_new": 0, "files_downloaded": 0, "bytes": 0}
 
@@ -141,172 +325,12 @@ def sync_issue(client: TrackerClient, conn, key: str, full: bool) -> dict:
     if row and not full and row["updated_at"] == parse_ts(card.get("updatedAt")):
         return {"status": "unchanged"}
 
-    with conn.transaction():
-        with conn.cursor() as cur:
-            stats["status"] = "new" if not row else "updated"
-
-            aliases = set(card.get("aliases") or [])
-            if row and row["key"] != cur_key:
-                aliases.add(row["key"])  # перенос задачи между очередями
-
-            issue_values = {
-                "id": issue_id,
-                "key": cur_key,
-                "summary": card.get("summary") or "",
-                "description": card.get("description") or "",
-                "queue": (card.get("queue") or {}).get("key", ""),
-                "queue_name": (card.get("queue") or {}).get("display", ""),
-                "status_key": (card.get("status") or {}).get("key"),
-                "status_name": (card.get("status") or {}).get("display"),
-                "type_name": (card.get("type") or {}).get("display"),
-                "priority_name": (card.get("priority") or {}).get("display"),
-                "assignee": (card.get("assignee") or {}).get("login"),
-                "assignee_name": (card.get("assignee") or {}).get("display"),
-                "created_by": (card.get("createdBy") or {}).get("login"),
-                "created_by_name": (card.get("createdBy") or {}).get("display"),
-                "followers": Jsonb([{"login": f.get("login"), "display": f.get("display")}
-                                    for f in card.get("followers") or []]),
-                "tags": Jsonb(card.get("tags") or []),
-                "created_at": card.get("createdAt"),
-                "updated_at": card.get("updatedAt"),
-                "resolved_at": card.get("resolvedAt"),
-                "raw": Jsonb(card),
-            }
-            cur.execute(
-                """INSERT INTO issues (id, key, summary, description, queue, queue_name,
-                         status_key, status_name, type_name, priority_name,
-                         assignee, assignee_name, created_by, created_by_name,
-                         followers, tags, created_at, updated_at, resolved_at, raw, synced_at)
-                   VALUES (%(id)s, %(key)s, %(summary)s, %(description)s, %(queue)s, %(queue_name)s,
-                           %(status_key)s, %(status_name)s, %(type_name)s, %(priority_name)s,
-                           %(assignee)s, %(assignee_name)s, %(created_by)s, %(created_by_name)s,
-                           %(followers)s, %(tags)s, %(created_at)s, %(updated_at)s,
-                           %(resolved_at)s, %(raw)s, now())
-                   ON CONFLICT (id) DO UPDATE SET
-                     key = EXCLUDED.key, summary = EXCLUDED.summary,
-                     description = EXCLUDED.description, queue = EXCLUDED.queue,
-                     queue_name = EXCLUDED.queue_name, status_key = EXCLUDED.status_key,
-                     status_name = EXCLUDED.status_name, type_name = EXCLUDED.type_name,
-                     priority_name = EXCLUDED.priority_name, assignee = EXCLUDED.assignee,
-                     assignee_name = EXCLUDED.assignee_name, created_by = EXCLUDED.created_by,
-                     created_by_name = EXCLUDED.created_by_name, followers = EXCLUDED.followers,
-                     tags = EXCLUDED.tags, created_at = EXCLUDED.created_at,
-                     updated_at = EXCLUDED.updated_at, resolved_at = EXCLUDED.resolved_at,
-                     raw = EXCLUDED.raw, synced_at = now()""",
-                issue_values,
-            )
-            for alias in aliases - {cur_key}:
-                cur.execute(
-                    """INSERT INTO issue_aliases (alias, issue_id) VALUES (%s, %s)
-                       ON CONFLICT (alias) DO UPDATE SET issue_id = EXCLUDED.issue_id, seen_at = now()""",
-                    (alias, issue_id),
-                )
-
-            # --- комментарии ---
-            comments = client.get_paginated(f"/issues/{key}/comments")
-            for c in comments:
-                if c.get("text") and len(c["text"]) >= TRUNCATION_GUARD:
-                    try:  # страховка обрезки: дотянуть полный текст поштучно
-                        detail = client.get_json(f"/issues/{cur_key}/comments/{c['id']}")
-                        c["text"] = detail.get("text") or c["text"]
-                    except TrackerError:
-                        pass
-            cur.execute("SELECT id FROM issue_comments WHERE issue_id = %s", (issue_id,))
-            existing = {r["id"] for r in cur.fetchall()}
-            for c in comments:
-                cur.execute(
-                    """INSERT INTO issue_comments (id, issue_id, long_id, text, author, author_name,
-                                 created_at, updated_at, version, transport, type, raw, synced_at)
-                       VALUES (%(id)s, %(issue_id)s, %(long_id)s, %(text)s, %(author)s, %(author_name)s,
-                               %(created_at)s, %(updated_at)s, %(version)s, %(transport)s, %(type)s,
-                               %(raw)s, now())
-                       ON CONFLICT (id) DO UPDATE SET text = EXCLUDED.text,
-                         author = EXCLUDED.author, author_name = EXCLUDED.author_name,
-                         updated_at = EXCLUDED.updated_at, version = EXCLUDED.version,
-                         raw = EXCLUDED.raw, synced_at = now()""",
-                    {
-                        "id": c["id"], "issue_id": issue_id, "long_id": c.get("longId"),
-                        "text": c.get("text") or "", "author": (c.get("createdBy") or {}).get("login"),
-                        "author_name": (c.get("createdBy") or {}).get("display"),
-                        "created_at": c.get("createdAt"), "updated_at": c.get("updatedAt"),
-                        "version": c.get("version"), "transport": c.get("transport"),
-                        "type": c.get("type"), "raw": Jsonb(c),
-                    },
-                )
-            stats["comments_new"] = len({c["id"] for c in comments} - existing)
-            if comments:
-                cur.execute(
-                    "DELETE FROM issue_comments WHERE issue_id = %s AND id <> ALL(%s)",
-                    (issue_id, [c["id"] for c in comments]),
-                )
-
-            # --- вложения: метаданные + скачивание ---
-            atts = client.get_paginated(f"/issues/{key}/attachments")
-            cur.execute("SELECT id FROM issue_attachments WHERE issue_id = %s", (issue_id,))
-            existing_att = {r["id"] for r in cur.fetchall()}
-            for a in atts:
-                rel_path = f"{cur_key}/{a['id']}_{sanitize(a.get('name') or '')}"
-                cur.execute(
-                    """INSERT INTO issue_attachments (id, issue_id, name, size, mimetype, author,
-                                 created_at, content_url, raw, synced_at)
-                       VALUES (%(id)s, %(issue_id)s, %(name)s, %(size)s, %(mimetype)s, %(author)s,
-                               %(created_at)s, %(content_url)s, %(raw)s, now())
-                       ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, size = EXCLUDED.size,
-                         mimetype = EXCLUDED.mimetype, content_url = EXCLUDED.content_url,
-                         raw = EXCLUDED.raw, synced_at = now()""",
-                    {
-                        "id": int(a["id"]), "issue_id": issue_id, "name": a.get("name") or "",
-                        "size": a.get("size") or 0, "mimetype": a.get("mimetype"),
-                        "author": (a.get("createdBy") or {}).get("login"),
-                        "created_at": a.get("createdAt"), "content_url": a.get("content") or "",
-                        "raw": Jsonb(a),
-                    },
-                )
-                dest = settings.attachments_dir / rel_path
-                if a.get("content") and not (
-                    dest.exists() and dest.stat().st_size == (a.get("size") or 0)
-                ):
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-                    client.download(a["content"], dest)
-                    stats["files_downloaded"] += 1
-                    stats["bytes"] += a.get("size") or 0
-                cur.execute(
-                    "UPDATE issue_attachments SET file_path = %s, downloaded_at = now() WHERE id = %s",
-                    (rel_path, int(a["id"])),
-                )
-            stats["attachments_new"] = len({int(a["id"]) for a in atts} - existing_att)
-            if atts:
-                cur.execute(
-                    "DELETE FROM issue_attachments WHERE issue_id = %s AND id <> ALL(%s)",
-                    (issue_id, [int(a["id"]) for a in atts]),
-                )
-
-            # --- changelog ---
-            changes = client.get_paginated(f"/issues/{key}/changelog")
-            cur.execute("SELECT id FROM issue_changelog WHERE issue_id = %s", (issue_id,))
-            existing_cl = {r["id"] for r in cur.fetchall()}
-            for ch in changes:
-                cur.execute(
-                    """INSERT INTO issue_changelog (id, issue_id, updated_at, author, author_name,
-                                 transport, type, fields, raw, synced_at)
-                       VALUES (%(id)s, %(issue_id)s, %(updated_at)s, %(author)s, %(author_name)s,
-                               %(transport)s, %(type)s, %(fields)s, %(raw)s, now())
-                       ON CONFLICT (id) DO UPDATE SET updated_at = EXCLUDED.updated_at,
-                         fields = EXCLUDED.fields, raw = EXCLUDED.raw, synced_at = now()""",
-                    {
-                        "id": ch["id"], "issue_id": issue_id, "updated_at": ch.get("updatedAt"),
-                        "author": (ch.get("updatedBy") or {}).get("login"),
-                        "author_name": (ch.get("updatedBy") or {}).get("display"),
-                        "transport": ch.get("transport"), "type": ch.get("type"),
-                        "fields": Jsonb(ch.get("fields") or []), "raw": Jsonb(ch),
-                    },
-                )
-            stats["changelog_new"] = len({c["id"] for c in changes} - existing_cl)
-            if changes:
-                cur.execute(
-                    "DELETE FROM issue_changelog WHERE issue_id = %s AND id <> ALL(%s)",
-                    (issue_id, [c["id"] for c in changes]),
-                )
+    with conn.transaction(), conn.cursor() as cur:
+        stats["status"] = "new" if not row else "updated"
+        _upsert_issue(cur, card, row)
+        _sync_comments(client, cur, issue_id, cur_key, stats)
+        _sync_attachments(client, cur, issue_id, cur_key, stats)
+        _sync_changelog(client, cur, issue_id, key, stats)
 
     return stats
 

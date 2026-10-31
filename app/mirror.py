@@ -1,37 +1,39 @@
 """SQL-слой зеркала Трекера — общий для API и MCP."""
+from psycopg import sql
+
 from app.config import settings
 
 
 def search_issues(conn, q: str | None = None, queue: str | None = None,
                   status: str | None = None) -> list[dict]:
     """Список задач зеркала с итогами (комментарии, вложения, часы табеля)."""
-    where, params = [], {}
+    conds, params = [], {}
     if q:
-        where.append("(i.summary ILIKE '%%' || %(q)s || '%%' OR i.description ILIKE '%%' || %(q)s || '%%')")
-        params["q"] = q
+        # шаблон %…% в значении параметра — литеральных % в SQL нет
+        conds.append(
+            sql.SQL("(i.summary ILIKE ") + sql.Placeholder("q_like")
+            + sql.SQL(" OR i.description ILIKE ") + sql.Placeholder("q_like") + sql.SQL(")"))
+        params["q_like"] = f"%{q}%"
     if queue:
-        where.append("i.queue = %(queue)s")
+        conds.append(sql.SQL("i.queue = ") + sql.Placeholder("queue"))
         params["queue"] = queue
     if status:
-        where.append("i.status_key = %(status)s")
+        conds.append(sql.SQL("i.status_key = ") + sql.Placeholder("status"))
         params["status"] = status
-    cond = ("WHERE " + " AND ".join(where)) if where else ""
+    where = sql.SQL(" WHERE ") + sql.SQL(" AND ").join(conds) if conds else sql.SQL("")
 
+    query = sql.SQL(
+        """SELECT i.key, i.summary, i.queue, i.status_key, i.status_name,
+                  i.assignee_name, i.updated_at::text AS updated_at,
+                  (SELECT count(*) FROM issue_comments c WHERE c.issue_id = i.id) AS comments_count,
+                  (SELECT count(*) FROM issue_attachments a WHERE a.issue_id = i.id) AS attachments_count,
+                  (SELECT sum(te.hours)::float8 FROM time_entries te
+                     WHERE te.task_key = i.key
+                        OR te.task_key IN (SELECT alias FROM issue_aliases al WHERE al.issue_id = i.id)
+                  ) AS timesheet_hours
+           FROM issues i""") + where + sql.SQL(" ORDER BY i.updated_at DESC NULLS LAST")
     with conn.cursor() as cur:
-        cur.execute(
-            f"""SELECT i.key, i.summary, i.queue, i.status_key, i.status_name,
-                       i.assignee_name, i.updated_at::text AS updated_at,
-                       (SELECT count(*) FROM issue_comments c WHERE c.issue_id = i.id) AS comments_count,
-                       (SELECT count(*) FROM issue_attachments a WHERE a.issue_id = i.id) AS attachments_count,
-                       (SELECT sum(te.hours)::float8 FROM time_entries te
-                          WHERE te.task_key = i.key
-                             OR te.task_key IN (SELECT alias FROM issue_aliases al WHERE al.issue_id = i.id)
-                       ) AS timesheet_hours
-                FROM issues i
-                {cond}
-                ORDER BY i.updated_at DESC NULLS LAST""",
-            params,
-        )
+        cur.execute(query, params)
         return cur.fetchall()
 
 

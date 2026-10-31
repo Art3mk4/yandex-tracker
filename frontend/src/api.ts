@@ -10,16 +10,27 @@ import type {
   TaskTotal,
 } from './types'
 
-function qs(filters: Filters): string {
-  const p = new URLSearchParams()
-  if (filters.date_from) p.set('date_from', filters.date_from)
-  if (filters.date_to) p.set('date_to', filters.date_to)
-  if (filters.project_id) p.set('project_id', String(filters.project_id))
-  if (filters.queue) p.set('queue', filters.queue)
-  if (filters.task.trim()) p.set('task', filters.task.trim())
-  if (filters.state) p.set('state', filters.state)
-  const s = p.toString()
-  return s ? `?${s}` : ''
+type Params = Record<string, string | number | null | undefined>
+
+/** URL с query-параметрами; пустые значения пропускаются. */
+function withParams(path: string, params: Params): string {
+  const q = Object.entries(params)
+    .filter(([, v]) => v !== null && v !== undefined && v !== '')
+    .map(([k, v]) => `${k}=${encodeURIComponent(String(v))}`)
+    .join('&')
+  return q ? `${path}?${q}` : path
+}
+
+/** Фильтры табеля → query-параметры. */
+function filterParams(f: Filters): Params {
+  return {
+    date_from: f.date_from,
+    date_to: f.date_to,
+    project_id: f.project_id,
+    queue: f.queue,
+    task: f.task.trim() || null,
+    state: f.state,
+  }
 }
 
 async function get<T>(url: string): Promise<T> {
@@ -31,15 +42,18 @@ async function get<T>(url: string): Promise<T> {
 export const getMeta = () => get<Meta>('/api/meta')
 export const getProjects = () => get<Project[]>('/api/projects')
 export const getEntries = (f: Filters) =>
-  get<{ entries: Entry[]; count: number; total_hours: number }>(`/api/entries${qs(f)}`)
+  get<{ entries: Entry[]; count: number; total_hours: number }>(withParams('/api/entries', filterParams(f)))
 export const getDaily = (f: Filters) =>
-  get<{ days: DailyTotal[]; total_hours: number }>(`/api/totals/daily${qs(f)}`)
+  get<{ days: DailyTotal[]; total_hours: number }>(withParams('/api/totals/daily', filterParams(f)))
 export const getTasks = (f: Filters) =>
   get<{ tasks: TaskTotal[]; tasks_total: number; total_hours: number }>(
-    `/api/totals/tasks?top=15${qs(f).slice(1) ? '&' + qs(f).slice(1) : ''}`,
+    withParams('/api/totals/tasks', { top: 15, ...filterParams(f) }),
   )
+
+// --- Зеркало Яндекс Трекера ---
+
 export const getIssues = (q: string, queue: string | null) =>
-  get<IssueListItem[]>(`/api/issues${q || queue ? '?' : ''}${q ? 'q=' + encodeURIComponent(q) : ''}${q && queue ? '&' : ''}${queue ? 'queue=' + queue : ''}`)
+  get<IssueListItem[]>(withParams('/api/issues', { q: q.trim() || null, queue }))
 
 export const getIssue = (key: string) => get<IssueDetail>(`/api/issues/${encodeURIComponent(key)}`)
 
