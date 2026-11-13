@@ -67,6 +67,8 @@ python3 estimate.py --from 2026-01-01 --to 2026-01-01 --calibrate TIMESHEET.md
 python3 timesheet_to_tracker.py --parse-only          # что прочиталось
 python3 timesheet_to_tracker.py [--task KEY-123]      # dry-run
 python3 timesheet_to_tracker.py --task KEY-123 --apply
+# то же напрямую через REST (без браузера): --rest, креды из .env, тоже dry-run по умолчанию
+python3 timesheet_to_tracker.py --rest [--task KEY-123 --apply]
 
 # табель → БД дашборда (идемпотентно)
 docker compose run --rm app python -m app.import_timesheet --dry-run
@@ -86,7 +88,7 @@ docker compose run --rm --user "$(id -u):$(id -g)" app python -m app.tracker_syn
 | Путь | Что |
 |---|---|
 | `estimate.py` | черновик часов: сессии Claude Code (в чате, вне чата, ресурс модели), git reflog, `--extra` |
-| `timesheet_to_tracker.py` | разбор табеля (`parse_rows`) → `timesheet.json` + `sync.js` |
+| `timesheet_to_tracker.py` | разбор табеля (`parse_rows`) → `timesheet.json` + `sync.js`; `--rest` — запись напрямую через API (дедуп `plan_actions`) |
 | `sync-core.js` | логика записи ворклогов (общая для консоли и extension) |
 | `app/` | FastAPI: API (`api.py`), импорт (`import_timesheet.py`), синк зеркала (`tracker_sync.py`), MCP (`mcp_server.py`) |
 | `db/init/` | SQL-схемы: табель (001) и зеркало (002), идемпотентные |
@@ -124,6 +126,9 @@ npm run dev      # vite с прокси /api на 127.0.0.1:8787
   вложения — строки из цифр.
 - Веб-интерфейс Трекера ходит в тот же `/api/public/v3` с сессией браузера —
   `fetch(url, {credentials: 'include'})` из вкладки работает без токена.
+- На REST-хосте `api.tracker.yandex.net` ворклоги — только по `/worklog` в единственном
+  числе (`/worklogs` → 404); GET списка — голый JSON-массив, `createdBy` в нём есть,
+  комментарий возвращается в `text`, а `start` ответ отдаёт в UTC (день — по локальной дате).
 
 ## Дальше
 

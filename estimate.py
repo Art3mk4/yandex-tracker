@@ -2,10 +2,11 @@
 """Оценка часов по дням и задачам из локальных источников — черновик для TIMESHEET.md.
 
 Источники:
-  сессии Claude Code  ~/.claude/projects/*/**.jsonl — все проекты, включая агентов
-                      (<сессия>/subagents/); задача — ID, упомянутый последним в тексте
-                      пользователя или ассистента (сводки компакций, вложения и
-                      результаты инструментов не считаются);
+  сессии             ~/.claude, ~/.claude-zai, ~/.claude-local (/projects/*/**.jsonl) —
+                     Claude Code, GLM по API и локальная модель; все проекты, включая
+                     агентов (<сессия>/subagents/); задача — ID, упомянутый последним
+                     в тексте пользователя или ассистента (сводки компакций, вложения и
+                     результаты инструментов не считаются);
   вне чата            паузы 20–180 мин, когда ассистент попросил действие (выполнить
                       в консоли, Portainer, деплой) или пользователь вернулся с
                       вставленным выводом — выкатка, SQL на стенде и т. п.;
@@ -42,7 +43,10 @@ OUTSIDE_MAX = timedelta(hours=3)  # дольше — перерыв даже п�
 STEP = 0.25
 DEFAULT_PREFIXES = "MANAGEMENT,BACKEND,ANALYTICS,TESTING,FRONTEND,MOBILE"
 TOKENS_PER_HOUR = 150_000  # выходных токенов на час работы; уточняется --calibrate
-PROJECTS = Path.home() / ".claude" / "projects"
+# Корни сессий: Claude Code, замена на GLM по API и локальная модель —
+# схема журналов совместима, лишние типы строк парсер игнорирует
+SESSION_ROOTS = [Path.home() / harness / "projects"
+                 for harness in (".claude", ".claude-zai", ".claude-local")]
 CODE_ROOT = Path(__file__).resolve().parent.parent
 ASKS_ACTION = re.compile(
     r"выполните|запустите|нажмите|вставьте|пришлите|в консол|portainer|deploy|деплой|"
@@ -299,7 +303,8 @@ def main() -> None:
     parser.add_argument("--from", dest="date_from", required=True, type=date.fromisoformat)
     parser.add_argument("--to", dest="date_to", required=True, type=date.fromisoformat)
     parser.add_argument("--sessions", type=Path, action="append",
-                        help="папка сессий Claude Code (можно несколько); по умолчанию — все")
+                        help="папка сессий (можно несколько); по умолчанию — все "
+                             "из ~/.claude, ~/.claude-zai и ~/.claude-local")
     parser.add_argument("--repo", type=Path, action="append",
                         help="git-репозиторий для reflog; по умолчанию — репозитории выбранных сессий")
     parser.add_argument("--extra", type=Path, help="JSON с дополнительными оценками")
@@ -320,7 +325,8 @@ def main() -> None:
 
     rx = task_re(args.prefixes.split(","))
     folders = [p.expanduser() for p in args.sessions] if args.sessions else sorted(
-        p for p in PROJECTS.iterdir() if p.is_dir())
+        (p for root in SESSION_ROOTS if root.is_dir() for p in root.iterdir() if p.is_dir()),
+        key=lambda p: p.name)
     sessions = Sessions(folders, rx)
     boot = None if args.no_uptime else boot_time()
 
