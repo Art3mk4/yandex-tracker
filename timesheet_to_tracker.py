@@ -6,7 +6,7 @@
 
 1. sync.js (путь по умолчанию): скрипт читает таблицу «Записи» и генерирует
    timesheet.json (машиночитаемые записи, формат Chrome extension) и sync.js
-   (sync-core.js + данные). sync.js выполняют во вкладке https://tracker.yandex.ru
+   (sync-core.js + данные). sync.js выполняют во вкладке https://tracker.yandex.net
    (консоль DevTools или Claude через браузер): запросы идут к API через адрес
    веб-интерфейса /api/public/v3 с сессией браузера. Токен не нужен, куки из
    браузера не извлекаются.
@@ -70,7 +70,7 @@ ORG_ID = os.environ.get("TRACKER_ORG_ID") or ENV.get("TRACKER_ORG_ID", "")
 
 # sync.js = sync-core.js (общая логика, её же использует extension) + вызов с данными.
 # Всё обёрнуто в async-функцию: повторная вставка в консоль не конфликтует по именам.
-JS_WRAPPER = """// Сгенерировано timesheet_to_tracker.py {generated}. Выполнять на https://tracker.yandex.ru
+JS_WRAPPER = """// Сгенерировано timesheet_to_tracker.py {generated}. Выполнять на https://tracker.yandex.net
 await (async () => {{
 {core}
   const ENTRIES = {entries};
@@ -337,7 +337,7 @@ def main() -> None:
     OUT_JS.write_text(build_js(entries, args.apply), encoding="utf-8")
     mode = "ЗАПИСЬ" if args.apply else "dry-run"
     print(f"\n{OUT_JSON.name} и {OUT_JS.name} ({mode}) готовы.")
-    print("Выполнить: открыть https://tracker.yandex.ru → DevTools (F12) → Console →")
+    print("Выполнить: открыть https://tracker.yandex.net → DevTools (F12) → Console →")
     print("вставить содержимое файла → Enter. Или попросить Claude выполнить его в браузере.")
 
 

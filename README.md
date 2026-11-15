@@ -63,7 +63,7 @@ TIMESHEET.md ──import──▶ Postgres ──▶ FastAPI + Vue SPA (даш�
 # черновик часов за день (сессии всех проектов + git reflog)
 python3 estimate.py --from 2026-01-01 --to 2026-01-01 --calibrate TIMESHEET.md
 
-# табель → Трекер (генерирует sync.js для консоли https://tracker.yandex.ru)
+# табель → Трекер (генерирует sync.js для консоли https://tracker.yandex.net)
 python3 timesheet_to_tracker.py --parse-only          # что прочиталось
 python3 timesheet_to_tracker.py [--task KEY-123]      # dry-run
 python3 timesheet_to_tracker.py --task KEY-123 --apply
