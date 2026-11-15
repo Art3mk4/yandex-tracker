@@ -1,6 +1,6 @@
 // Синхронизация ворклогов Яндекс Трекера с записями timesheet.
 // Общая логика для консоли DevTools (sync.js) и Chrome extension.
-// Выполнять в контексте https://tracker.yandex.ru: запросы идут к API через адрес
+// Выполнять в контексте https://tracker.yandex.net: запросы идут к API через адрес
 // веб-интерфейса /api/public/v3 с сессией браузера (credentials: 'include'),
 // токены и куки не читаются.
 //
